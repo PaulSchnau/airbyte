@@ -11,10 +11,12 @@ from datetime import datetime
 from typing import List
 from unittest.mock import Mock
 
+import aiohttp
 import freezegun
 import pendulum
 import pytest
 import requests_mock
+from aioresponses import CallbackResult, aioresponses
 from airbyte_cdk.models import AirbyteStream, ConfiguredAirbyteCatalog, ConfiguredAirbyteStream, DestinationSyncMode, SyncMode, Type
 from airbyte_cdk.sources.streams import Stream
 from airbyte_cdk.sources.streams.concurrent.adapters import StreamFacade
@@ -81,39 +83,55 @@ def test_login_authentication_error_handler(
         assert msg == expected_error_msg
 
 
-def test_bulk_sync_creation_failed(stream_config, stream_api):
+@pytest.mark.asyncio
+async def test_bulk_sync_creation_failed(stream_config, stream_api):
     stream: BulkIncrementalSalesforceStream = generate_stream("Account", stream_config, stream_api)
-    with requests_mock.Mocker() as m:
-        m.register_uri("POST", stream.path(), status_code=400, json=[{"message": "test_error"}])
-        with pytest.raises(HTTPError) as err:
-            stream_slices = next(iter(stream.stream_slices(sync_mode=SyncMode.incremental)))
-            next(stream.read_records(sync_mode=SyncMode.full_refresh, stream_slice=stream_slices))
-        assert err.value.response.json()[0]["message"] == "test_error"
+    await stream.ensure_session()
+
+    def callback(*args, **kwargs):
+        return CallbackResult(status=400, reason="test_error", content_type="application/json")
+
+    with aioresponses() as m:
+        m.post("https://fase-account.salesforce.com/services/data/v57.0/jobs/query", status=400, callback=callback)
+        with pytest.raises(aiohttp.ClientResponseError) as err:
+            stream_slices = await anext(stream.stream_slices(sync_mode=SyncMode.incremental))
+            [r async for r in stream.read_records(sync_mode=SyncMode.full_refresh, stream_slice=stream_slices)]
+    assert err.value.message == "test_error"
+    await stream._session.close()
 
 
-def test_bulk_stream_fallback_to_rest(mocker, requests_mock, stream_config, stream_api):
+@pytest.mark.asyncio
+async def test_bulk_stream_fallback_to_rest(mocker, stream_config, stream_api):
     """
     Here we mock BULK API with response returning error, saying BULK is not supported for this kind of entity.
     On the other hand, we mock REST API for this same entity with a successful response.
     After having instantiated a BulkStream, sync should succeed in case it falls back to REST API. Otherwise it would throw an error.
     """
     stream = generate_stream("CustomEntity", stream_config, stream_api)
-    # mock a BULK API
-    requests_mock.register_uri(
-        "POST",
-        "https://fase-account.salesforce.com/services/data/v57.0/jobs/query",
-        status_code=400,
-        json=[{"errorCode": "INVALIDENTITY", "message": "CustomEntity is not supported by the Bulk API"}],
-    )
+    await stream.ensure_session()
+
+    def callback(*args, **kwargs):
+        return CallbackResult(status=400, payload={"errorCode": "INVALIDENTITY", "message": "CustomEntity is not supported by the Bulk API"}, content_type="application/json")
+
     rest_stream_records = [
         {"id": 1, "name": "custom entity", "created": "2010-11-11"},
         {"id": 11, "name": "custom entity", "created": "2020-01-02"},
     ]
-    # mock REST API
-    mocker.patch("source_salesforce.source.RestSalesforceStream.read_records", lambda *args, **kwargs: iter(rest_stream_records))
-    assert type(stream) is BulkIncrementalSalesforceStream
-    stream_slices = next(iter(stream.stream_slices(sync_mode=SyncMode.incremental)))
-    assert list(stream.read_records(sync_mode=SyncMode.full_refresh, stream_slice=stream_slices)) == rest_stream_records
+    async def get_records(*args, **kwargs):
+        nonlocal rest_stream_records
+        for record in rest_stream_records:
+            yield record
+
+    # mock a BULK API
+    with aioresponses() as m:
+        m.post("https://fase-account.salesforce.com/services/data/v57.0/jobs/query", status=400, callback=callback)
+        # mock REST API
+        stream.read_records = get_records
+        assert type(stream) is BulkIncrementalSalesforceStream
+        stream_slices = await anext(stream.stream_slices(sync_mode=SyncMode.incremental))
+        assert [r async for r in stream.read_records(sync_mode=SyncMode.full_refresh, stream_slice=stream_slices)] == rest_stream_records
+
+    await stream._session.close()
 
 
 def test_stream_unsupported_by_bulk(stream_config, stream_api):
@@ -135,30 +153,40 @@ def test_stream_contains_unsupported_properties_by_bulk(stream_config, stream_ap
     assert not isinstance(stream, BulkSalesforceStream)
 
 
-def test_bulk_sync_pagination(stream_config, stream_api, requests_mock):
+@pytest.mark.asyncio
+async def test_bulk_sync_pagination(stream_config, stream_api, requests_mock):
     stream: BulkIncrementalSalesforceStream = generate_stream("Account", stream_config, stream_api)
+    await stream.ensure_session()
     job_id = "fake_job"
-    requests_mock.register_uri("POST", stream.path(), json={"id": job_id})
-    requests_mock.register_uri("GET", stream.path() + f"/{job_id}", json={"state": "JobComplete"})
-    resp_text = ["Field1,LastModifiedDate,ID"] + [f"test,2021-11-16,{i}" for i in range(5)]
-    result_uri = requests_mock.register_uri(
-        "GET",
-        stream.path() + f"/{job_id}/results",
-        [
-            {"text": "\n".join(resp_text), "headers": {"Sforce-Locator": "somelocator_1"}},
-            {"text": "\n".join(resp_text), "headers": {"Sforce-Locator": "somelocator_2"}},
-            {"text": "\n".join(resp_text), "headers": {"Sforce-Locator": "null"}},
-        ],
-    )
-    requests_mock.register_uri("DELETE", stream.path() + f"/{job_id}")
+    call_counter = 0
 
-    stream_slices = next(iter(stream.stream_slices(sync_mode=SyncMode.incremental)))
-    loaded_ids = [int(record["ID"]) for record in stream.read_records(sync_mode=SyncMode.full_refresh, stream_slice=stream_slices)]
+    def callback(*args, **kwargs):
+        nonlocal call_counter
+        call_counter += 1
+
+    with aioresponses() as m:
+        m.post(stream.path(), payload={"id": job_id}, callback=callback)
+        m.get(stream.path() + f"/{job_id}", payload={"state": "JobComplete"}, callback=callback)
+
+        resp_text = ["Field1,LastModifiedDate,ID"] + [f"test,2021-11-16,{i}" for i in range(5)]
+        result_uri = requests_mock.register_uri(
+            "GET",
+            stream.path() + f"/{job_id}/results",
+            [
+                {"text": "\n".join(resp_text), "headers": {"Sforce-Locator": "somelocator_1"}},
+                {"text": "\n".join(resp_text), "headers": {"Sforce-Locator": "somelocator_2"}},
+                {"text": "\n".join(resp_text), "headers": {"Sforce-Locator": "null"}},
+            ],
+        )
+        m.delete(stream.path() + f"/{job_id}")
+
+    stream_slices = anext(await stream.stream_slices(sync_mode=SyncMode.incremental))
+    loaded_ids = [int(record["ID"]) async for record in stream.read_records(sync_mode=SyncMode.full_refresh, stream_slice=stream_slices)]
     assert loaded_ids == [0, 1, 2, 3, 4, 0, 1, 2, 3, 4, 0, 1, 2, 3, 4]
-    assert result_uri.call_count == 3
+    assert call_counter == 3
     assert result_uri.request_history[1].query == "locator=somelocator_1"
     assert result_uri.request_history[2].query == "locator=somelocator_2"
-
+    await stream._session.close()
 
 
 

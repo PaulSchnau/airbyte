@@ -357,7 +357,12 @@ class BulkSalesforceStream(SalesforceStream):
         response = await self._session.request(method, url=url, headers=headers, json=json)
         if response.status not in [200, 204]:
             self.logger.error(f"error body: {await response.text()}, sobject options: {self.sobject_options}")
-        response.raise_for_status()
+        try:
+            response.raise_for_status()
+        except AssertionError:
+            raise aiohttp.ClientResponseError(
+                response.request_info, history=response.history, status=response.status, message=response.content, headers=response.headers,
+            )
         return response  # TODO: how to handle the stream argument
 
     async def create_stream_job(self, query: str, url: str) -> Optional[str]:
