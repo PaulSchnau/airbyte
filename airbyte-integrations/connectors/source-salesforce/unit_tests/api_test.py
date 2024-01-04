@@ -980,27 +980,25 @@ async def test_bulk_stream_request_params_states(stream_config_date_format, stre
 
     with aioresponses() as m:
         m.post(base_url, callback=lambda *args, **kwargs: CallbackResult(payload={"id": job_id_1}))
-        m.post(base_url, callback=lambda *args, **kwargs: CallbackResult(payload={"id": job_id_2}))
-        m.post(base_url, callback=lambda *args, **kwargs: CallbackResult(payload={"id": job_id_3}))
-
         m.get(base_url + f"/{job_id_1}", callback=lambda *args, **kwargs: CallbackResult(payload={"state": "JobComplete"}))
+        m.delete(base_url + f"/{job_id_1}")
         m.get(base_url + f"/{job_id_1}/results",
               callback=lambda *args, **kwargs: CallbackResult(body="Field1,LastModifiedDate,ID\ntest,2023-01-15,1"))
-        m.patch(base_url + f"/{job_id_1}", callback=lambda *args, **kwargs: CallbackResult())
+        m.patch(base_url + f"/{job_id_1}")
 
+        m.post(base_url, callback=lambda *args, **kwargs: CallbackResult(payload={"id": job_id_2}))
         m.get(base_url + f"/{job_id_2}", callback=lambda *args, **kwargs: CallbackResult(payload={"state": "JobComplete"}))
+        m.delete(base_url + f"/{job_id_2}")
         m.get(base_url + f"/{job_id_2}/results",
               callback=lambda *args, **kwargs: CallbackResult(body="Field1,LastModifiedDate,ID\ntest,2023-04-01,2\ntest,2023-02-20,22"))
-        m.patch(base_url + f"/{job_id_2}", callback=lambda *args, **kwargs: CallbackResult())
+        m.patch(base_url + f"/{job_id_2}")
 
+        m.post(base_url, callback=lambda *args, **kwargs: CallbackResult(payload={"id": job_id_3}))
         m.get(base_url + f"/{job_id_3}", callback=lambda *args, **kwargs: CallbackResult(payload={"state": "JobComplete"}))
+        m.delete(base_url + f"/{job_id_3}")
         m.get(base_url + f"/{job_id_3}/results",
               callback=lambda *args, **kwargs: CallbackResult(body="Field1,LastModifiedDate,ID\ntest,2023-04-01,3"))
-        m.patch(base_url + f"/{job_id_3}", callback=lambda *args, **kwargs: CallbackResult())
-
-        m.delete(base_url + f"/{job_id_1}")  # TODO: did GPT forget this?
-        m.delete(base_url + f"/{job_id_2}")  # TODO: did GPT forget this?
-        m.delete(base_url + f"/{job_id_3}")  # TODO: did GPT forget this?
+        m.patch(base_url + f"/{job_id_3}")
 
         logger = logging.getLogger("airbyte")
         state = {"Account": {"LastModifiedDate": "2023-01-01T10:10:10.000Z"}}
