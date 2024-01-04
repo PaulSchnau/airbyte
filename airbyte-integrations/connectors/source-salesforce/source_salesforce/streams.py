@@ -320,15 +320,16 @@ class RestSalesforceStream(SalesforceStream):
 class BatchedSubStream(AsyncHttpSubStream):
     SLICE_BATCH_SIZE = 200
 
-    def stream_slices(
+    async def stream_slices(
         self, sync_mode: SyncMode, cursor_field: Optional[List[str]] = None, stream_state: Optional[Mapping[str, Any]] = None
     ) -> Iterable[Optional[Mapping[str, Any]]]:
         """Instead of yielding one parent record at a time, make stream slice contain a batch of parent records.
 
         It allows to get <SLICE_BATCH_SIZE> records by one requests (instead of only one).
         """
+        await self.ensure_session()  # TODO: should this be self or super?
         batched_slice = []
-        for stream_slice in super().stream_slices(sync_mode, cursor_field, stream_state):
+        async for stream_slice in super().stream_slices(sync_mode, cursor_field, stream_state):
             if len(batched_slice) == self.SLICE_BATCH_SIZE:
                 yield {"parents": batched_slice}
                 batched_slice = []

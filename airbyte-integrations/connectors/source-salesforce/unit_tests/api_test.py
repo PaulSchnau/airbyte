@@ -10,6 +10,7 @@ import re
 from datetime import datetime
 from typing import List
 from unittest.mock import Mock
+from yarl import URL
 
 import aiohttp
 import freezegun
@@ -960,61 +961,70 @@ async def test_bulk_stream_slices(stream_config_date_format, stream_api):
         start_date = start_date.add(days=stream.STREAM_SLICE_STEP)
     assert expected_slices == stream_slices
 
+
+@pytest.mark.asyncio
 @freezegun.freeze_time("2023-04-01")
-def test_bulk_stream_request_params_states(stream_config_date_format, stream_api, bulk_catalog, requests_mock):
-    """Check that request params ignore records cursor and use start date from slice ONLY"""
+async def test_bulk_stream_request_params_states(stream_config_date_format, stream_api, bulk_catalog):
     stream_config_date_format.update({"start_date": "2023-01-01"})
     stream: BulkIncrementalSalesforceStream = generate_stream("Account", stream_config_date_format, stream_api)
+    await stream.ensure_session()
 
     source = SourceSalesforce(_ANY_CATALOG, _ANY_CONFIG)
     source.streams = Mock()
     source.streams.return_value = [stream]
+    base_url = f"{stream.sf_api.instance_url}{stream.path()}"
 
     job_id_1 = "fake_job_1"
-    requests_mock.register_uri("GET", stream.path() + f"/{job_id_1}", [{"json": {"state": "JobComplete"}}])
-    requests_mock.register_uri("DELETE", stream.path() + f"/{job_id_1}")
-    requests_mock.register_uri("GET", stream.path() + f"/{job_id_1}/results", text="Field1,LastModifiedDate,ID\ntest,2023-01-15,1")
-    requests_mock.register_uri("PATCH", stream.path() + f"/{job_id_1}")
-
     job_id_2 = "fake_job_2"
-    requests_mock.register_uri("GET", stream.path() + f"/{job_id_2}", [{"json": {"state": "JobComplete"}}])
-    requests_mock.register_uri("DELETE", stream.path() + f"/{job_id_2}")
-    requests_mock.register_uri(
-        "GET", stream.path() + f"/{job_id_2}/results", text="Field1,LastModifiedDate,ID\ntest,2023-04-01,2\ntest,2023-02-20,22"
-    )
-    requests_mock.register_uri("PATCH", stream.path() + f"/{job_id_2}")
-
     job_id_3 = "fake_job_3"
-    queries_history = requests_mock.register_uri(
-        "POST", stream.path(), [{"json": {"id": job_id_1}}, {"json": {"id": job_id_2}}, {"json": {"id": job_id_3}}]
-    )
-    requests_mock.register_uri("GET", stream.path() + f"/{job_id_3}", [{"json": {"state": "JobComplete"}}])
-    requests_mock.register_uri("DELETE", stream.path() + f"/{job_id_3}")
-    requests_mock.register_uri("GET", stream.path() + f"/{job_id_3}/results", text="Field1,LastModifiedDate,ID\ntest,2023-04-01,3")
-    requests_mock.register_uri("PATCH", stream.path() + f"/{job_id_3}")
 
-    logger = logging.getLogger("airbyte")
-    state = {"Account": {"LastModifiedDate": "2023-01-01T10:10:10.000Z"}}
-    bulk_catalog.streams.pop(1)
-    result = [i for i in source.read(logger=logger, config=stream_config_date_format, catalog=bulk_catalog, state=state)]
+    with aioresponses() as m:
+        m.post(base_url, callback=lambda *args, **kwargs: CallbackResult(payload={"id": job_id_1}))
+        m.post(base_url, callback=lambda *args, **kwargs: CallbackResult(payload={"id": job_id_2}))
+        m.post(base_url, callback=lambda *args, **kwargs: CallbackResult(payload={"id": job_id_3}))
+
+        m.get(base_url + f"/{job_id_1}", callback=lambda *args, **kwargs: CallbackResult(payload={"state": "JobComplete"}))
+        m.get(base_url + f"/{job_id_1}/results",
+              callback=lambda *args, **kwargs: CallbackResult(body="Field1,LastModifiedDate,ID\ntest,2023-01-15,1"))
+        m.patch(base_url + f"/{job_id_1}", callback=lambda *args, **kwargs: CallbackResult())
+
+        m.get(base_url + f"/{job_id_2}", callback=lambda *args, **kwargs: CallbackResult(payload={"state": "JobComplete"}))
+        m.get(base_url + f"/{job_id_2}/results",
+              callback=lambda *args, **kwargs: CallbackResult(body="Field1,LastModifiedDate,ID\ntest,2023-04-01,2\ntest,2023-02-20,22"))
+        m.patch(base_url + f"/{job_id_2}", callback=lambda *args, **kwargs: CallbackResult())
+
+        m.get(base_url + f"/{job_id_3}", callback=lambda *args, **kwargs: CallbackResult(payload={"state": "JobComplete"}))
+        m.get(base_url + f"/{job_id_3}/results",
+              callback=lambda *args, **kwargs: CallbackResult(body="Field1,LastModifiedDate,ID\ntest,2023-04-01,3"))
+        m.patch(base_url + f"/{job_id_3}", callback=lambda *args, **kwargs: CallbackResult())
+
+        m.delete(base_url + f"/{job_id_1}")  # TODO: did GPT forget this?
+        m.delete(base_url + f"/{job_id_2}")  # TODO: did GPT forget this?
+        m.delete(base_url + f"/{job_id_3}")  # TODO: did GPT forget this?
+
+        logger = logging.getLogger("airbyte")
+        state = {"Account": {"LastModifiedDate": "2023-01-01T10:10:10.000Z"}}
+        bulk_catalog.streams.pop(1)
+        result = [i for i in source.read(logger=logger, config=stream_config_date_format, catalog=bulk_catalog, state=state)]
 
     actual_state_values = [item.state.data.get("Account").get(stream.cursor_field) for item in result if item.type == Type.STATE]
+    queries_history = m.requests
+
     # assert request params
     assert (
-        "LastModifiedDate >= 2023-01-01T10:10:10.000+00:00 AND LastModifiedDate < 2023-01-31T10:10:10.000+00:00"
-        in queries_history.request_history[0].text
+            "LastModifiedDate >= 2023-01-01T10:10:10.000+00:00 AND LastModifiedDate < 2023-01-31T10:10:10.000+00:00"
+            in queries_history[("POST", URL(base_url))][0].kwargs["json"]["query"]
     )
     assert (
-        "LastModifiedDate >= 2023-01-31T10:10:10.000+00:00 AND LastModifiedDate < 2023-03-02T10:10:10.000+00:00"
-        in queries_history.request_history[1].text
+            "LastModifiedDate >= 2023-01-31T10:10:10.000+00:00 AND LastModifiedDate < 2023-03-02T10:10:10.000+00:00"
+            in queries_history[("POST", URL(base_url))][1].kwargs["json"]["query"]
     )
     assert (
-        "LastModifiedDate >= 2023-03-02T10:10:10.000+00:00 AND LastModifiedDate < 2023-04-01T00:00:00.000+00:00"
-        in queries_history.request_history[2].text
+            "LastModifiedDate >= 2023-03-02T10:10:10.000+00:00 AND LastModifiedDate < 2023-04-01T00:00:00.000+00:00"
+            in queries_history[("POST", URL(base_url))][2].kwargs["json"]["query"]
     )
 
     # assert states
-    # if connector meets record with cursor `2023-04-01` out of current slice range 2023-01-31 <> 2023-03-02, we ignore all other values and set state to slice end_date
     expected_state_values = ["2023-01-15T00:00:00+00:00", "2023-03-02T10:10:10+00:00", "2023-04-01T00:00:00+00:00"]
     assert actual_state_values == expected_state_values
 
@@ -1033,30 +1043,26 @@ def test_request_params_substream(stream_config_date_format, stream_api):
     assert params == {"q": "SELECT LastModifiedDate, Id FROM ContentDocumentLink WHERE ContentDocumentId IN ('1','2')"}
 
 
+@pytest.mark.asyncio
 @freezegun.freeze_time("2023-03-20")
-def test_stream_slices_for_substream(stream_config, stream_api, requests_mock):
-    """Test BulkSalesforceSubStream for ContentDocumentLink (+ parent ContentDocument)
-
-    ContentDocument return 1 record for each slice request.
-    Given start/end date leads to 3 date slice for ContentDocument, thus 3 total records
-
-    ContentDocumentLink
-    It means that ContentDocumentLink should have 2 slices, with 2 and 1 records in each
-    """
+async def test_stream_slices_for_substream(stream_config, stream_api):
     stream_config['start_date'] = '2023-01-01'
     stream: BulkSalesforceSubStream = generate_stream("ContentDocumentLink", stream_config, stream_api)
     stream.SLICE_BATCH_SIZE = 2  # each ContentDocumentLink should contain 2 records from parent ContentDocument stream
+    await stream.ensure_session()
 
     job_id = "fake_job"
-    requests_mock.register_uri("POST", stream.path(), json={"id": job_id})
-    requests_mock.register_uri("GET", stream.path() + f"/{job_id}", json={"state": "JobComplete"})
-    requests_mock.register_uri("GET", stream.path() + f"/{job_id}/results", [{"text": "Field1,LastModifiedDate,ID\ntest,2021-11-16,123", "headers": {"Sforce-Locator": "null"}}])
-    requests_mock.register_uri("DELETE", stream.path() + f"/{job_id}")
+    base_url = f"{stream.sf_api.instance_url}{stream.path()}"
 
-    stream_slices = list(stream.stream_slices(sync_mode=SyncMode.full_refresh))
-    assert stream_slices == [
-         {'parents': [{'Field1': 'test', 'ID': '123', 'LastModifiedDate': '2021-11-16'},
-                      {'Field1': 'test', 'ID': '123', 'LastModifiedDate': '2021-11-16'}]},
-         {'parents': [{'Field1': 'test', 'ID': '123', 'LastModifiedDate': '2021-11-16'}]}
-    ]
+    with aioresponses() as m:
+        m.post(base_url, repeat=True, callback=lambda *args, **kwargs: CallbackResult(payload={"id": job_id}))
+        m.get(base_url + f"/{job_id}", repeat=True, callback=lambda *args, **kwargs: CallbackResult(payload={"state": "JobComplete"}))
+        m.get(base_url + f"/{job_id}/results", repeat=True, callback=lambda *args, **kwargs: CallbackResult(body="Field1,LastModifiedDate,ID\ntest,2021-11-16,123", headers={"Sforce-Locator": "null"}))
+        m.delete(base_url + f"/{job_id}", repeat=True, callback=lambda *args, **kwargs: CallbackResult())
 
+        stream_slices = [slice async for slice in stream.stream_slices(sync_mode=SyncMode.full_refresh)]
+        assert stream_slices == [
+             {'parents': [{'Field1': 'test', 'ID': '123', 'LastModifiedDate': '2021-11-16'},
+                          {'Field1': 'test', 'ID': '123', 'LastModifiedDate': '2021-11-16'}]},
+             {'parents': [{'Field1': 'test', 'ID': '123', 'LastModifiedDate': '2021-11-16'}]}
+        ]
