@@ -154,110 +154,132 @@ def test_stream_contains_unsupported_properties_by_bulk(stream_config, stream_ap
 
 
 @pytest.mark.asyncio
-async def test_bulk_sync_pagination(stream_config, stream_api, requests_mock):
+async def test_bulk_sync_pagination(stream_config, stream_api):
     stream: BulkIncrementalSalesforceStream = generate_stream("Account", stream_config, stream_api)
     await stream.ensure_session()
     job_id = "fake_job"
     call_counter = 0
 
-    def callback(*args, **kwargs):
+    def cb1(*args, **kwargs):
         nonlocal call_counter
         call_counter += 1
+        return CallbackResult(headers={"Sforce-Locator": "somelocator_1"}, body="\n".join(resp_text))
+
+    def cb2(*args, **kwargs):
+        nonlocal call_counter
+        call_counter += 1
+        return CallbackResult(headers={"Sforce-Locator": "somelocator_2"}, body="\n".join(resp_text))
+
+    def cb3(*args, **kwargs):
+        nonlocal call_counter
+        call_counter += 1
+        return CallbackResult(headers={"Sforce-Locator": "null"}, body="\n".join(resp_text))
 
     with aioresponses() as m:
-        m.post(stream.path(), payload={"id": job_id}, callback=callback)
-        m.get(stream.path() + f"/{job_id}", payload={"state": "JobComplete"}, callback=callback)
-
+        base_url = f"{stream.sf_api.instance_url}{stream.path()}"
+        m.post(f"{base_url}", callback=lambda *args, **kwargs: CallbackResult(payload={"id": job_id}))
+        m.get(f"{base_url}/{job_id}", callback=lambda *args, **kwargs: CallbackResult(payload={"state": "JobComplete"}))
         resp_text = ["Field1,LastModifiedDate,ID"] + [f"test,2021-11-16,{i}" for i in range(5)]
-        result_uri = requests_mock.register_uri(
-            "GET",
-            stream.path() + f"/{job_id}/results",
-            [
-                {"text": "\n".join(resp_text), "headers": {"Sforce-Locator": "somelocator_1"}},
-                {"text": "\n".join(resp_text), "headers": {"Sforce-Locator": "somelocator_2"}},
-                {"text": "\n".join(resp_text), "headers": {"Sforce-Locator": "null"}},
-            ],
-        )
-        m.delete(stream.path() + f"/{job_id}")
+        m.get(f"{base_url}/{job_id}/results", callback=cb1)
+        m.get(f"{base_url}/{job_id}/results?locator=somelocator_1", callback=cb2)
+        m.get(f"{base_url}/{job_id}/results?locator=somelocator_2", callback=cb3)
+        m.delete(base_url + f"/{job_id}")
 
-    stream_slices = anext(await stream.stream_slices(sync_mode=SyncMode.incremental))
-    loaded_ids = [int(record["ID"]) async for record in stream.read_records(sync_mode=SyncMode.full_refresh, stream_slice=stream_slices)]
-    assert loaded_ids == [0, 1, 2, 3, 4, 0, 1, 2, 3, 4, 0, 1, 2, 3, 4]
-    assert call_counter == 3
-    assert result_uri.request_history[1].query == "locator=somelocator_1"
-    assert result_uri.request_history[2].query == "locator=somelocator_2"
-    await stream._session.close()
+        stream_slices = await anext(stream.stream_slices(sync_mode=SyncMode.incremental))
+        loaded_ids = [int(record["ID"]) async for record in stream.read_records(sync_mode=SyncMode.full_refresh, stream_slice=stream_slices)]
+        assert loaded_ids == [0, 1, 2, 3, 4, 0, 1, 2, 3, 4, 0, 1, 2, 3, 4]
+        assert call_counter == 3
+        await stream._session.close()
 
 
 
 
 def _prepare_mock(m, stream):
     job_id = "fake_job_1"
-    m.register_uri("POST", stream.path(), json={"id": job_id})
-    m.register_uri("DELETE", stream.path() + f"/{job_id}")
-    m.register_uri("GET", stream.path() + f"/{job_id}/results", text="Field1,LastModifiedDate,ID\ntest,2021-11-16,1")
-    m.register_uri("PATCH", stream.path() + f"/{job_id}", text="")
+    base_url = f"{stream.sf_api.instance_url}{stream.path()}"
+    m.post(base_url, callback=lambda *args, **kwargs: CallbackResult(payload={"id": job_id}))
+    m.delete(base_url + f"/{job_id}")
+    m.get(base_url + f"/{job_id}/results", callback=lambda *args, **kwargs: CallbackResult(body="Field1,LastModifiedDate,ID\ntest,2021-11-16,1"))
+    m.patch(base_url + f"/{job_id}", callback=lambda *args, **kwargs: CallbackResult(body=""))
     return job_id
 
 
-def _get_result_id(stream):
-    stream_slices = next(iter(stream.stream_slices(sync_mode=SyncMode.incremental)))
-    return int(list(stream.read_records(sync_mode=SyncMode.full_refresh, stream_slice=stream_slices))[0]["ID"])
+async def _get_result_id(stream):
+    stream_slices = await anext(stream.stream_slices(sync_mode=SyncMode.incremental))
+    records = [r async for r in stream.read_records(sync_mode=SyncMode.full_refresh, stream_slice=stream_slices)]
+    return int(list(records)[0]["ID"])
 
 
-def test_bulk_sync_successful(stream_config, stream_api):
+@pytest.mark.asyncio
+async def test_bulk_sync_successful(stream_config, stream_api):
     stream: BulkIncrementalSalesforceStream = generate_stream("Account", stream_config, stream_api)
-    with requests_mock.Mocker() as m:
+    await stream.ensure_session()
+    base_url = f"{stream.sf_api.instance_url}{stream.path()}"
+
+    with aioresponses() as m:
+        m.post(base_url, callback=lambda *args, **kwargs: CallbackResult(payload={"id": job_id}))
+
+    with aioresponses() as m:
         job_id = _prepare_mock(m, stream)
-        m.register_uri("GET", stream.path() + f"/{job_id}", [{"json": {"state": "JobComplete"}}])
-        assert _get_result_id(stream) == 1
+        m.get(base_url + f"/{job_id}", callback=lambda *args, **kwargs: CallbackResult(payload={"state": "JobComplete"}))
+        assert await _get_result_id(stream) == 1
 
 
-def test_bulk_sync_successful_long_response(stream_config, stream_api):
+@pytest.mark.asyncio
+async def test_bulk_sync_successful_long_response(stream_config, stream_api):
     stream: BulkIncrementalSalesforceStream = generate_stream("Account", stream_config, stream_api)
-    with requests_mock.Mocker() as m:
+    await stream.ensure_session()
+    base_url = f"{stream.sf_api.instance_url}{stream.path()}"
+
+    with aioresponses() as m:
         job_id = _prepare_mock(m, stream)
-        m.register_uri(
-            "GET",
-            stream.path() + f"/{job_id}",
-            [
-                {"json": {"state": "UploadComplete", "id": job_id}},
-                {"json": {"state": "InProgress", "id": job_id}},
-                {"json": {"state": "JobComplete", "id": job_id}},
-            ],
-        )
-        assert _get_result_id(stream) == 1
+        m.get(base_url + f"/{job_id}", callback=lambda *args, **kwargs: CallbackResult(payload={"state": "UploadComplete", "id": job_id}))
+        m.get(base_url + f"/{job_id}", callback=lambda *args, **kwargs: CallbackResult(payload={"state": "InProgress", "id": job_id}))
+        m.get(base_url + f"/{job_id}", callback=lambda *args, **kwargs: CallbackResult(payload={"state": "JobComplete", "id": job_id}))
+        assert await _get_result_id(stream) == 1
 
 
 # maximum timeout is wait_timeout * max_retry_attempt
 # this test tries to check a job state 17 times with +-1second for very one
+@pytest.mark.asyncio
 @pytest.mark.timeout(17)
-def test_bulk_sync_successful_retry(stream_config, stream_api):
+async def test_bulk_sync_successful_retry(stream_config, stream_api):
     stream: BulkIncrementalSalesforceStream = generate_stream("Account", stream_config, stream_api)
     stream.DEFAULT_WAIT_TIMEOUT_SECONDS = 6  # maximum wait timeout will be 6 seconds
+    await stream.ensure_session()
+    base_url = f"{stream.sf_api.instance_url}{stream.path()}"
 
-    with requests_mock.Mocker() as m:
+    with aioresponses() as m:
         job_id = _prepare_mock(m, stream)
         # 2 failed attempts, 3rd one should be successful
         states = [{"json": {"state": "InProgress", "id": job_id}}] * 17
         states.append({"json": {"state": "JobComplete", "id": job_id}})
         # raise Exception(states)
-        m.register_uri("GET", stream.path() + f"/{job_id}", states)
-        assert _get_result_id(stream) == 1
+        for _ in range(17):
+            m.get(base_url + f"/{job_id}", callback=lambda *args, **kwargs: CallbackResult(payload={"state": "InProgress", "id": job_id}))
+        m.get(base_url + f"/{job_id}", callback=lambda *args, **kwargs: CallbackResult(payload={"state": "JobComplete", "id": job_id}))
+
+        assert await _get_result_id(stream) == 1
 
 
+@pytest.mark.asyncio
 @pytest.mark.timeout(30)
-def test_bulk_sync_failed_retry(stream_config, stream_api):
+async def test_bulk_sync_failed_retry(stream_config, stream_api):
     stream: BulkIncrementalSalesforceStream = generate_stream("Account", stream_config, stream_api)
     stream.DEFAULT_WAIT_TIMEOUT_SECONDS = 6  # maximum wait timeout will be 6 seconds
-    with requests_mock.Mocker() as m:
+    await stream.ensure_session()
+    base_url = f"{stream.sf_api.instance_url}{stream.path()}"
+
+    with aioresponses() as m:
         job_id = _prepare_mock(m, stream)
-        m.register_uri("GET", stream.path() + f"/{job_id}", json={"state": "InProgress", "id": job_id})
+        m.get(base_url + f"/{job_id}", repeat=True, callback=lambda *args, **kwargs: CallbackResult(payload={"state": "InProgress", "id": job_id}))
+        m.post(base_url, repeat=True, callback=lambda *args, **kwargs: CallbackResult(payload={"id": job_id}))
         with pytest.raises(Exception) as err:
-            stream_slices = next(iter(stream.stream_slices(sync_mode=SyncMode.incremental)))
-            next(stream.read_records(sync_mode=SyncMode.full_refresh, stream_slice=stream_slices))
+            stream_slices = await anext(stream.stream_slices(sync_mode=SyncMode.incremental))
+            [record async for record in stream.read_records(sync_mode=SyncMode.full_refresh, stream_slice=stream_slices)]
         assert "stream using BULK API was failed" in str(err.value)
 
+    await stream._session.close()
 
 @pytest.mark.parametrize(
     "start_date_provided,stream_name,expected_start_date",
@@ -292,67 +314,77 @@ def test_stream_start_datetime_format_should_not_changed(stream_config, stream_a
     assert stream.start_date == "2010-01-18T21:18:20Z"
 
 
-def test_download_data_filter_null_bytes(stream_config, stream_api):
+@pytest.mark.asyncio
+async def test_download_data_filter_null_bytes(stream_config, stream_api):
     job_full_url_results: str = "https://fase-account.salesforce.com/services/data/v57.0/jobs/query/7504W00000bkgnpQAA/results"
     stream: BulkIncrementalSalesforceStream = generate_stream("Account", stream_config, stream_api)
+    await stream.ensure_session()
 
-    with requests_mock.Mocker() as m:
-        m.register_uri("GET", job_full_url_results, content=b"\x00")
-        tmp_file, response_encoding, _ = stream.download_data(url=job_full_url_results)
+    with aioresponses() as m:
+        m.get(job_full_url_results, callback=lambda *args, **kwargs: CallbackResult(body=b"\x00"))
+        tmp_file, response_encoding, _ = await stream.download_data(url=job_full_url_results)
         res = list(stream.read_with_chunks(tmp_file, response_encoding))
         assert res == []
 
-        m.register_uri("GET", job_full_url_results, content=b'"Id","IsDeleted"\n\x00"0014W000027f6UwQAI","false"\n\x00\x00')
-        tmp_file, response_encoding, _ = stream.download_data(url=job_full_url_results)
+        m.get(job_full_url_results, callback=lambda *args, **kwargs: CallbackResult(body=b'"Id","IsDeleted"\n\x00"0014W000027f6UwQAI","false"\n\x00\x00'))
+        tmp_file, response_encoding, _ = await stream.download_data(url=job_full_url_results)
         res = list(stream.read_with_chunks(tmp_file, response_encoding))
         assert res == [{"Id": "0014W000027f6UwQAI", "IsDeleted": "false"}]
 
 
-def test_read_with_chunks_should_return_only_object_data_type(stream_config, stream_api):
+@pytest.mark.asyncio
+async def test_read_with_chunks_should_return_only_object_data_type(stream_config, stream_api):
     job_full_url_results: str = "https://fase-account.salesforce.com/services/data/v57.0/jobs/query/7504W00000bkgnpQAA/results"
     stream: BulkIncrementalSalesforceStream = generate_stream("Account", stream_config, stream_api)
+    await stream.ensure_session()
 
-    with requests_mock.Mocker() as m:
-        m.register_uri("GET", job_full_url_results, content=b'"IsDeleted","Age"\n"false",24\n')
-        tmp_file, response_encoding, _ = stream.download_data(url=job_full_url_results)
+    with aioresponses() as m:
+        m.get(job_full_url_results, callback=lambda *args, **kwargs: CallbackResult(body=b'"IsDeleted","Age"\n"false",24\n'))
+        tmp_file, response_encoding, _ = await stream.download_data(url=job_full_url_results)
         res = list(stream.read_with_chunks(tmp_file, response_encoding))
         assert res == [{"IsDeleted": "false", "Age": "24"}]
 
 
-def test_read_with_chunks_should_return_a_string_when_a_string_with_only_digits_is_provided(stream_config, stream_api):
+@pytest.mark.asyncio
+async def test_read_with_chunks_should_return_a_string_when_a_string_with_only_digits_is_provided(stream_config, stream_api):
     job_full_url_results: str = "https://fase-account.salesforce.com/services/data/v57.0/jobs/query/7504W00000bkgnpQAA/results"
     stream: BulkIncrementalSalesforceStream = generate_stream("Account", stream_config, stream_api)
+    await stream.ensure_session()
 
-    with requests_mock.Mocker() as m:
-        m.register_uri("GET", job_full_url_results, content=b'"ZipCode"\n"01234"\n')
-        tmp_file, response_encoding, _ = stream.download_data(url=job_full_url_results)
+    with aioresponses() as m:
+        m.get(job_full_url_results, body=b'"ZipCode"\n"01234"\n')
+        tmp_file, response_encoding, _ = await stream.download_data(url=job_full_url_results)
         res = list(stream.read_with_chunks(tmp_file, response_encoding))
         assert res == [{"ZipCode": "01234"}]
 
 
-def test_read_with_chunks_should_return_null_value_when_no_data_is_provided(stream_config, stream_api):
+@pytest.mark.asyncio
+async def test_read_with_chunks_should_return_null_value_when_no_data_is_provided(stream_config, stream_api):
     job_full_url_results: str = "https://fase-account.salesforce.com/services/data/v57.0/jobs/query/7504W00000bkgnpQAA/results"
     stream: BulkIncrementalSalesforceStream = generate_stream("Account", stream_config, stream_api)
+    await stream.ensure_session()
 
-    with requests_mock.Mocker() as m:
-        m.register_uri("GET", job_full_url_results, content=b'"IsDeleted","Age","Name"\n"false",,"Airbyte"\n')
-        tmp_file, response_encoding, _ = stream.download_data(url=job_full_url_results)
+    with aioresponses() as m:
+        m.get(job_full_url_results, body=b'"IsDeleted","Age","Name"\n"false",,"Airbyte"\n')
+        tmp_file, response_encoding, _ = await stream.download_data(url=job_full_url_results)
         res = list(stream.read_with_chunks(tmp_file, response_encoding))
         assert res == [{"IsDeleted": "false", "Age": None, "Name": "Airbyte"}]
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "chunk_size, content_type_header, content, expected_result",
     encoding_symbols_parameters(),
     ids=[f"charset: {x[1]}, chunk_size: {x[0]}" for x in encoding_symbols_parameters()],
 )
-def test_encoding_symbols(stream_config, stream_api, chunk_size, content_type_header, content, expected_result):
+async def test_encoding_symbols(stream_config, stream_api, chunk_size, content_type_header, content, expected_result):
     job_full_url_results: str = "https://fase-account.salesforce.com/services/data/v57.0/jobs/query/7504W00000bkgnpQAA/results"
     stream: BulkIncrementalSalesforceStream = generate_stream("Account", stream_config, stream_api)
+    await stream.ensure_session()
 
-    with requests_mock.Mocker() as m:
-        m.register_uri("GET", job_full_url_results, headers=content_type_header, content=content)
-        tmp_file, response_encoding, _ = stream.download_data(url=job_full_url_results)
+    with aioresponses() as m:
+        m.get(job_full_url_results, headers=content_type_header, body=content)
+        tmp_file, response_encoding, _ = await stream.download_data(url=job_full_url_results)
         res = list(stream.read_with_chunks(tmp_file, response_encoding))
         assert res == expected_result
 
@@ -370,7 +402,7 @@ def test_encoding_symbols(stream_config, stream_api, chunk_size, content_type_he
         ),
     ),
 )
-def test_check_connection_rate_limit(
+async def test_check_connection_rate_limit(
     stream_config, login_status_code, login_json_resp, discovery_status_code, discovery_resp_json, expected_error_msg
 ):
     source = SourceSalesforce(_ANY_CATALOG, _ANY_CONFIG)
@@ -787,8 +819,10 @@ def test_rest_stream_init_with_too_many_properties(stream_config, stream_api_v2_
         generate_stream("Account", stream_config, stream_api_v2_too_many_properties)
 
 
-def test_too_many_properties(stream_config, stream_api_v2_pk_too_many_properties, requests_mock):
+@pytest.mark.asyncio
+async def test_too_many_properties(stream_config, stream_api_v2_pk_too_many_properties, requests_mock):
     stream = generate_stream("Account", stream_config, stream_api_v2_pk_too_many_properties)
+    await stream.ensure_session()
     chunks = list(stream.chunk_properties())
     for chunk in chunks:
         assert stream.primary_key in chunk
@@ -796,29 +830,27 @@ def test_too_many_properties(stream_config, stream_api_v2_pk_too_many_properties
     assert stream.too_many_properties
     assert stream.primary_key
     assert type(stream) == RestSalesforceStream
-    url = next_page_url = "https://fase-account.salesforce.com/services/data/v57.0/queryAll"
-    requests_mock.get(
-        url,
-        [
-            {
-                "json": {
+    next_page_url = "https://fase-account.salesforce.com/services/data/v57.0/queryAll"
+    url_pattern = re.compile(r"https://fase-account\.salesforce\.com/services/data/v57\.0/queryAll\??.*")
+    with aioresponses() as m:
+        m.get(url_pattern, callback=lambda *args, **kwargs: CallbackResult(payload={
                     "records": [
                         {"Id": 1, "propertyA": "A"},
                         {"Id": 2, "propertyA": "A"},
                         {"Id": 3, "propertyA": "A"},
                         {"Id": 4, "propertyA": "A"},
                     ]
-                }
-            },
-            {"json": {"nextRecordsUrl": next_page_url, "records": [{"Id": 1, "propertyB": "B"}, {"Id": 2, "propertyB": "B"}]}},
-            # 2 for 2 chunks above
-            *[{"json": {"records": [{"Id": 1}, {"Id": 2}], "nextRecordsUrl": next_page_url}} for _ in range(chunks_len - 2)],
-            {"json": {"records": [{"Id": 3, "propertyB": "B"}, {"Id": 4, "propertyB": "B"}]}},
-            # 2 for 1 chunk above and 1 chunk had no next page
-            *[{"json": {"records": [{"Id": 3}, {"Id": 4}]}} for _ in range(chunks_len - 2)],
-        ],
-    )
-    records = list(stream.read_records(sync_mode=SyncMode.full_refresh))
+                }))
+        m.get(url_pattern, callback=lambda *args, **kwargs: CallbackResult(payload={"nextRecordsUrl": next_page_url, "records": [{"Id": 1, "propertyB": "B"}, {"Id": 2, "propertyB": "B"}]}))
+        # 2 for 2 chunks above
+        for _ in range(chunks_len - 2):
+            m.get(url_pattern, callback=lambda *args, **kwargs: CallbackResult(payload={"records": [{"Id": 1}, {"Id": 2}], "nextRecordsUrl": next_page_url}))
+        m.get(url_pattern, callback=lambda *args, **kwargs: CallbackResult(payload={"records": [{"Id": 3, "propertyB": "B"}, {"Id": 4, "propertyB": "B"}]}))
+        # 2 for 1 chunk above and 1 chunk had no next page
+        for _ in range(chunks_len - 2):
+            m.get(url_pattern, callback=lambda *args, **kwargs: CallbackResult(payload={"records": [{"Id": 3}, {"Id": 4}]}))
+
+        records = [r async for r in stream.read_records(sync_mode=SyncMode.full_refresh)]
     assert records == [
         {"Id": 1, "propertyA": "A", "propertyB": "B"},
         {"Id": 2, "propertyA": "A", "propertyB": "B"},
@@ -829,7 +861,8 @@ def test_too_many_properties(stream_config, stream_api_v2_pk_too_many_properties
         assert len(call.url) < Salesforce.REQUEST_SIZE_LIMITS
 
 
-def test_stream_with_no_records_in_response(stream_config, stream_api_v2_pk_too_many_properties, requests_mock):
+@pytest.mark.asyncio
+async def test_stream_with_no_records_in_response(stream_config, stream_api_v2_pk_too_many_properties):
     stream = generate_stream("Account", stream_config, stream_api_v2_pk_too_many_properties)
     chunks = list(stream.chunk_properties())
     for chunk in chunks:
@@ -837,47 +870,43 @@ def test_stream_with_no_records_in_response(stream_config, stream_api_v2_pk_too_
     assert stream.too_many_properties
     assert stream.primary_key
     assert type(stream) == RestSalesforceStream
-    url = "https://fase-account.salesforce.com/services/data/v57.0/queryAll"
-    requests_mock.get(
-        url,
-        [
-            {"json": {"records": []}},
-        ],
-    )
-    records = list(stream.read_records(sync_mode=SyncMode.full_refresh))
-    assert records == []
+    url = re.compile(r"https://fase-account\.salesforce\.com/services/data/v57\.0/queryAll\??.*")
+    await stream.ensure_session()
+
+    with aioresponses() as m:
+        m.get(url, repeat=True, callback=lambda *args, **kwargs: CallbackResult(payload={"records": []}))
+        records = [record async for record in stream.read_records(sync_mode=SyncMode.full_refresh)]
+        assert records == []
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "status_code,response_json,log_message",
     [
         (
-            400,
-            [{"errorCode": "INVALIDENTITY", "message": "Account is not supported by the Bulk API"}],
-            "Account is not supported by the Bulk API",
+                400,
+                {"errorCode": "INVALIDENTITY", "message": "Account is not supported by the Bulk API"},
+                "Account is not supported by the Bulk API",
         ),
-        (403, [{"errorCode": "REQUEST_LIMIT_EXCEEDED", "message": "API limit reached"}], "API limit reached"),
-        (400, [{"errorCode": "API_ERROR", "message": "API does not support query"}], "The stream 'Account' is not queryable,"),
+        (403, {"errorCode": "REQUEST_LIMIT_EXCEEDED", "message": "API limit reached"}, "API limit reached"),
+        (400, {"errorCode": "API_ERROR", "message": "API does not support query"}, "The stream 'Account' is not queryable,"),
         (
-            400,
-            [{"errorCode": "LIMIT_EXCEEDED", "message": "Max bulk v2 query jobs (10000) per 24 hrs has been reached (10021)"}],
-            "Your API key for Salesforce has reached its limit for the 24-hour period. We will resume replication once the limit has elapsed.",
+                400,
+                {"errorCode": "LIMIT_EXCEEDED", "message": "Max bulk v2 query jobs (10000) per 24 hrs has been reached (10021)"},
+                "Your API key for Salesforce has reached its limit for the 24-hour period. We will resume replication once the limit has elapsed.",
         ),
     ],
 )
-def test_bulk_stream_error_in_logs_on_create_job(requests_mock, stream_config, stream_api, status_code, response_json, log_message, caplog):
-    """ """
+async def test_bulk_stream_error_in_logs_on_create_job(stream_config, stream_api, status_code, response_json, log_message, caplog):
     stream = generate_stream("Account", stream_config, stream_api)
+    await stream.ensure_session()
     url = f"{stream.sf_api.instance_url}/services/data/{stream.sf_api.version}/jobs/query"
-    requests_mock.register_uri(
-        "POST",
-        url,
-        status_code=status_code,
-        json=response_json,
-    )
-    query = "Select Id, Subject from Account"
-    with caplog.at_level(logging.ERROR):
-        assert stream.create_stream_job(query, url) is None, "this stream should be skipped"
+
+    with aioresponses() as m:
+        m.post(url, status=status_code, callback=lambda *args, **kwargs: CallbackResult(status=status_code, payload=response_json, reason=""))
+        query = "Select Id, Subject from Account"
+        with caplog.at_level(logging.ERROR):
+            assert await stream.create_stream_job(query, url) is None, "this stream should be skipped"
 
     # check logs
     assert log_message in caplog.records[-1].message
@@ -913,10 +942,11 @@ def test_bulk_stream_error_on_wait_for_job(requests_mock, stream_config, stream_
     assert e.value.message == error_message
 
 
+@pytest.mark.asyncio()
 @freezegun.freeze_time("2023-01-01")
-def test_bulk_stream_slices(stream_config_date_format, stream_api):
+async def test_bulk_stream_slices(stream_config_date_format, stream_api):
     stream: BulkIncrementalSalesforceStream = generate_stream("FakeBulkStream", stream_config_date_format, stream_api)
-    stream_slices = list(stream.stream_slices(sync_mode=SyncMode.full_refresh))
+    stream_slices = [s async for s in stream.stream_slices(sync_mode=SyncMode.full_refresh)]
     expected_slices = []
     today = pendulum.today(tz="UTC")
     start_date = pendulum.parse(stream.start_date, tz="UTC")

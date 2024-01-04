@@ -268,7 +268,7 @@ class RestSalesforceStream(SalesforceStream):
                 continue
 
             # stick together different parts of records by their primary key and emit if a record is complete
-            for record in chunk_page_records:
+            async for record in records_generator_fn(request, response, stream_state, stream_slice):
                 property_chunk.record_counter += 1
                 record_id = record[self.primary_key]
                 if record_id not in records_by_primary_key:
@@ -359,10 +359,9 @@ class BulkSalesforceStream(SalesforceStream):
             self.logger.error(f"error body: {await response.text()}, sobject options: {self.sobject_options}")
         try:
             response.raise_for_status()
-        except AssertionError:
-            raise aiohttp.ClientResponseError(
-                response.request_info, history=response.history, status=response.status, message=response.content, headers=response.headers,
-            )
+        except aiohttp.ClientResponseError as err:
+            err._response_json = await response.json()  # https://github.com/aio-libs/aiohttp/issues/3248
+            raise err
         return response  # TODO: how to handle the stream argument
 
     async def create_stream_job(self, query: str, url: str) -> Optional[str]:
@@ -374,8 +373,8 @@ class BulkSalesforceStream(SalesforceStream):
             response = await self._send_http_request("POST", url, json=json)
             job_id: str = (await response.json())["id"]
             return job_id
-        except exceptions.HTTPError as error:  # TODO: which errors?
-            if error.response.status_code in [codes.FORBIDDEN, codes.BAD_REQUEST]:
+        except aiohttp.ClientResponseError as error:  # TODO: which errors?
+            if error.status in [codes.FORBIDDEN, codes.BAD_REQUEST]:
                 # A part of streams can't be used by BULK API. Every API version can have a custom list of
                 # these sobjects. Another part of them can be generated dynamically. That's why we can't track
                 # them preliminarily and there is only one way is to except error with necessary messages about
@@ -388,7 +387,10 @@ class BulkSalesforceStream(SalesforceStream):
                 #        updated query: "Select Name, (Select Subject,ActivityType from ActivityHistories) from Contact"
                 #    The second variant forces customisation for every case (ActivityHistory, ActivityHistories etc).
                 #    And the main problem is these subqueries doesn't support CSV response format.
-                error_data = error.response.json()[0]
+                if error.history:
+                    error_data = await error.history[0].json()[0]
+                else:
+                    error_data = error._response_json
                 error_code = error_data.get("errorCode")
                 error_message = error_data.get("message", "")
                 if error_message == "Selecting compound data not supported in Bulk Query" or (
@@ -398,29 +400,29 @@ class BulkSalesforceStream(SalesforceStream):
                         f"Cannot receive data for stream '{self.name}' using BULK API, "
                         f"sobject options: {self.sobject_options}, error message: '{error_message}'"
                     )
-                elif error.response.status_code == codes.FORBIDDEN and error_code != "REQUEST_LIMIT_EXCEEDED":
+                elif error.status == codes.FORBIDDEN and error_code != "REQUEST_LIMIT_EXCEEDED":
                     self.logger.error(
                         f"Cannot receive data for stream '{self.name}' ,"
                         f"sobject options: {self.sobject_options}, error message: '{error_message}'"
                     )
-                elif error.response.status_code == codes.FORBIDDEN and error_code == "REQUEST_LIMIT_EXCEEDED":
+                elif error.status == codes.FORBIDDEN and error_code == "REQUEST_LIMIT_EXCEEDED":
                     self.logger.error(
                         f"Cannot receive data for stream '{self.name}' ,"
                         f"sobject options: {self.sobject_options}, Error message: '{error_data.get('message')}'"
                     )
-                elif error.response.status_code == codes.BAD_REQUEST and error_message.endswith("does not support query"):
+                elif error.status == codes.BAD_REQUEST and error_message.endswith("does not support query"):
                     self.logger.error(
                         f"The stream '{self.name}' is not queryable, "
                         f"sobject options: {self.sobject_options}, error message: '{error_message}'"
                     )
                 elif (
-                    error.response.status_code == codes.BAD_REQUEST
+                    error.status == codes.BAD_REQUEST
                     and error_code == "API_ERROR"
                     and error_message.startswith("Implementation restriction")
                 ):
                     message = f"Unable to sync '{self.name}'. To prevent future syncs from failing, ensure the authenticated user has \"View all Data\" permissions."
                     raise AirbyteTracedException(message=message, failure_type=FailureType.config_error, exception=error)
-                elif error.response.status_code == codes.BAD_REQUEST and error_code == "LIMIT_EXCEEDED":
+                elif error.status == codes.BAD_REQUEST and error_code == "LIMIT_EXCEEDED":
                     message = "Your API key for Salesforce has reached its limit for the 24-hour period. We will resume replication once the limit has elapsed."
                     self.logger.error(message)
                 else:
